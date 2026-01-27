@@ -1,1 +1,1 @@
-# DB_Prediction_of_AIBubble
+# DB_Prediction_of_KOSPI
