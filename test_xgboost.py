@@ -21,10 +21,15 @@ print("Training model...")
 
 model = XGBClassifier(
     n_estimators=20,
+    #결정 나무 20개, 우리는 200~500 생각중, 과적합 주의
     max_depth=3,
+    #학계에서는 3~4 권장, 너무 깊으면 과적합 우려
     learning_rate=0.1,
+    #0.1 빠르지만 불안정, 0.01 느리자만 안정적
     eval_metric='logloss',
+    #얼마나 확신했는가를 평가
     random_state=42
+    #결과 변경 방지, 출발점 고정
 )
 
 model.fit(X_train, y_train)
