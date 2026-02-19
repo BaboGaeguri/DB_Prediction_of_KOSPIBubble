@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools import add_constant
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 # 데이터 로드
@@ -13,6 +15,9 @@ df = df[df["C1_NM"] == "KOSPI"].copy()
 # 날짜 정렬
 df["PRD_DE"] = pd.to_datetime(df["PRD_DE"], format="%Y%m")
 df = df.sort_values("PRD_DE").reset_index(drop=True)
+
+# 테스트용: 최근 50개월만 사용 (전체 데이터 사용 시 아래 줄 제거)
+df = df.tail(50).reset_index(drop=True)
 
 # P/D ratio 계산 (DT는 D/P in %, 역수 취함)
 df["PD_ratio"] = 100 / df["DT"]
@@ -47,12 +52,14 @@ def adf_stat(y, lag=0):
     return t_stat
 
 
-def bsadf(y, r0=0.01 + 1.8 / np.sqrt(len(y)), lag=0):
+def bsadf(y, r0=None, lag=0):
     """
     BSADF (Backward Supremum ADF) 통계량 계산
     각 시점 t에서 [r0*T, t]까지의 윈도우로 ADF 테스트 수행 후 supremum 반환
     """
     T = len(y)
+    if r0 is None:
+        r0 = 0.01 + 1.8 / np.sqrt(T)
     r0_obs = int(np.floor(r0 * T))
 
     adf_stats = []
@@ -138,8 +145,8 @@ print(f"GSADF 통계량: {gsadf_stat:.4f}")
 
 # 임계값 계산 (Monte Carlo)
 print("\n임계값 계산 중 (Monte Carlo 시뮬레이션)...")
-cv_95 = psy_critical_values(T, r0=r0, n_sim=500, significance=0.05)
-cv_99 = psy_critical_values(T, r0=r0, n_sim=500, significance=0.01)
+cv_95 = psy_critical_values(T, r0=r0, n_sim=10, significance=0.05)
+cv_99 = psy_critical_values(T, r0=r0, n_sim=10, significance=0.01)
 
 print(f"\n95% 임계값: {cv_95:.4f}")
 print(f"99% 임계값: {cv_99:.4f}")
@@ -162,6 +169,18 @@ else:
 print("\nBSADF 시계열 계산 중...")
 bsadf_stats = bsadf(y, r0=r0)
 bsadf_dates = df["PRD_DE"].values[int(np.floor(r0 * T)):]
+
+# 버블 라벨 생성: BSADF > 95% CV이면 1, 아니면 0
+bubble_label = (np.array(bsadf_stats) > cv_95).astype(int)
+
+# 전체 시점에 맞춰 라벨 구성 (BSADF가 없는 초기 구간은 0으로 설정)
+r0_obs = int(np.floor(r0 * T))
+label_full = np.zeros(T, dtype=int)
+label_full[r0_obs:] = bubble_label
+
+df["bubble"] = label_full
+df[["PRD_DE", "PD_ratio", "bubble"]].to_csv("bubble_labels.csv", index=False, encoding="utf-8-sig")
+print(f"\n버블 라벨 저장 완료: bubble=1 구간 {bubble_label.sum()}개월 / 전체 {T}개월")
 
 # 결과 시각화
 fig, axes = plt.subplots(2, 1, figsize=(12, 8))
@@ -187,6 +206,7 @@ axes[1].grid(True, alpha=0.3)
 
 plt.tight_layout()
 plt.savefig("PSY_test_result.png", dpi=150)
+print("\n결과가 'PSY_test_result.png'로 저장되었습니다.")
 plt.show()
 
 print("\n결과가 'PSY_test_result.png'로 저장되었습니다.")
