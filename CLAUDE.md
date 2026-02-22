@@ -11,12 +11,22 @@
 
 ## 3.2.1 버블 라벨 생성
 
-Phillips, Shi, and Yu(2015)의 PSY 절차를 적용하여 코스피 지수의 버블 형성 및 붕괴 시점을 식별한다. PSY 검정 결과에 따라 각 시점 $t$에 대해 버블 상태 여부를 이진 변수로 정의한다.
+Phillips, Shi, and Yu(2015)의 PSY 절차를 적용하여 코스피 지수의 버블 형성 및 붕괴 시점을 식별한다. PSY 검정 결과에 따라 각 시점 $t$에 대해 버블 상태 여부를 이진 변수로 정의한 뒤, 버블 구간 내에서 방향성을 추가로 분류하는 다중라벨(multilabel) 구조를 적용한다.
 
-- 버블 구간: $y_t = 1$
-- 비버블 구간: $y_t = 0$
+### 이진 분류 (bubble)
 
-이와 같이 생성된 $y_t$는 본 연구의 분류 대상(target variable)으로 사용된다.
+- 버블 구간: $bubble_t = 1$
+- 비버블 구간: $bubble_t = 0$
+
+### 다중라벨 분류 (bubble_up / bubble_down)
+
+Atsiwo(2025)의 방법론을 참고하여, 버블로 식별된 구간($bubble_t = 1$)을 자산가격 상승기(bubble up)와 붕괴기(bubble down)로 세분화한다.
+
+$$\text{bubble\_up}_t = \begin{cases} 1, & \text{if } bubble_t = 1 \text{ and } \frac{Y_{t+1} + \cdots + Y_{t+\tau}}{\tau} > Y_t \\ 0, & \text{otherwise} \end{cases}$$
+
+$$\text{bubble\_down}_t = \begin{cases} 1, & \text{if } bubble_t = 1 \text{ and } \frac{Y_{t+1} + \cdots + Y_{t+\tau}}{\tau} \leq Y_t \\ 0, & \text{otherwise} \end{cases}$$
+
+여기서 $\tau$는 향후 관측 윈도우 크기(기본값: 3개월), $Y_t$는 시점 $t$의 P/D ratio이다. 한 시점이 bubble이면서 동시에 bubble_up 또는 bubble_down 중 하나로 분류되므로 multilabel 구조에 해당한다.
 
 ### 구현 세부사항
 
@@ -24,8 +34,16 @@ Phillips, Shi, and Yu(2015)의 PSY 절차를 적용하여 코스피 지수의 �
 
 1. 각 시점 $t$에서 BSADF 통계량을 계산
 2. Monte Carlo 시뮬레이션으로 임계값(95% CV) 산출
-3. $BSADF_t > CV_{95}$ 이면 $y_t = 1$, 아니면 $y_t = 0$
-4. 생성된 라벨을 CSV로 저장하여 이후 분류 모델의 입력으로 사용
+3. $BSADF_t > CV_{95}$ 이면 $bubble_t = 1$, 아니면 $bubble_t = 0$
+4. $bubble_t = 1$인 시점에서 향후 $\tau$개월 평균 P/D ratio와 현재값을 비교하여 bubble_up / bubble_down 분류
+5. 생성된 라벨(bubble, bubble_up, bubble_down)을 CSV로 저장하여 이후 분류 모델의 입력으로 사용
+
+### 성능 최적화
+
+Monte Carlo 시뮬레이션은 계산 비용이 크므로 다음 두 가지 최적화를 적용한다.
+
+- **NumPy 직접 OLS**: `statsmodels.OLS` 대신 $\hat{\beta} = (X^\top X)^{-1} X^\top y$ 공식을 NumPy로 직접 계산하여 객체 생성 오버헤드를 제거 (약 5~10배 속도 향상)
+- **멀티프로세싱 병렬화**: Monte Carlo 시뮬레이션 $n_{sim}$회는 각 시뮬레이션이 독립적이므로 `multiprocessing.Pool`로 CPU 코어 수에 비례하여 병렬 실행 (Windows 환경에서 `if __name__ == '__main__':` 가드 필수)
 
 ---
 
