@@ -1,7 +1,7 @@
 import pandas as pd
 
 # CSV 불러오기
-df = pd.read_csv("ALL DATA.csv")
+df = pd.read_csv("ALLDATA.csv")
 
 # date 제거 (상관계수 계산에 필요 없음)
 df = df.drop(columns=['date '])
