@@ -1,13 +1,13 @@
 """
 pipeline_test.py - KOSPI 버블 예측 파이프라인 (빠른 테스트용)
 
-전체 pipeline을 단일 스크립트로 실행 (PSY_test.py 별도 실행 불필요)
+전체 pipeline을 단일 스크립트로 실행 (PSY 내장, 별도 실행 불필요)
 5분 이내 완료를 위한 축소 설정:
-  - PSY 데이터: KRX_배당수익률.csv tail(60) 사용
+  - PSY 데이터: ALL DATA.csv → PER (252개월, 2005/01~2025/12)
   - Monte Carlo: n_sim=20
-  - XGBoost: n_estimators=50
+  - XGBoost: RandomizedSearchCV (n_iter=12, TimeSeriesSplit)
 
-정식 실행은 PSY_test.py (전체 데이터, n_sim=500) + pipeline.py 사용
+정식 실행: python pipeline.py  (n_sim=500, 약 15~20분 소요)
 """
 
 import numpy as np
@@ -23,8 +23,9 @@ from sklearn.multioutput import MultiOutputClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.dummy import DummyClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.metrics import (
-    f1_score, balanced_accuracy_score, average_precision_score
+    f1_score, balanced_accuracy_score, average_precision_score, make_scorer
 )
 
 try:
@@ -131,19 +132,18 @@ if __name__ == '__main__':
     print("STEP 1. PSY 검정 (전체 데이터, n_sim=20 경량 Monte Carlo)")
     print("=" * 60)
 
-    krx = pd.read_csv("KRX_배당수익률.csv")
-    krx = krx[krx["C1_NM"] == "KOSPI"].copy()
-    krx["PRD_DE"] = pd.to_datetime(krx["PRD_DE"], format="%Y%m")
-    krx = krx.sort_values("PRD_DE").reset_index(drop=True)
+    df_psy = pd.read_csv("ALL DATA.csv")
+    df_psy.columns = df_psy.columns.str.strip()
+    df_psy["date"] = pd.to_datetime(df_psy["date"].str.strip(), format="%Y/%m")
+    if "Bubble" in df_psy.columns:
+        df_psy = df_psy.drop(columns=["Bubble"])
+    df_psy = df_psy.sort_values("date").reset_index(drop=True)
 
-    # 전체 데이터 사용 (n_sim=20으로 속도 확보)
-
-    krx["PD_ratio"] = 100 / krx["DT"]
-    y = krx["PD_ratio"].values
+    y = df_psy["PER"].values  # PSY 검정 변수: PER (버블 시 폭발적 상승 경향)
     T = len(y)
-    r0 = 0.01 + 1.8 / np.sqrt(T)
+    r0 = 15 / T  # 최소 윈도우 15개월 고정 (PSY 권장 공식 대체)
 
-    print(f"PSY 데이터: {krx['PRD_DE'].min().strftime('%Y-%m')} ~ {krx['PRD_DE'].max().strftime('%Y-%m')} ({T}개월)")
+    print(f"PSY 데이터 (PER): {df_psy['date'].min().strftime('%Y-%m')} ~ {df_psy['date'].max().strftime('%Y-%m')} ({T}개월)")
     print(f"r0={r0:.4f}, 최소 윈도우={int(np.floor(r0 * T))}개월\n")
 
     print("GSADF 계산 중...")
@@ -152,12 +152,9 @@ if __name__ == '__main__':
 
     print("\n임계값 계산 중 (Monte Carlo)...")
     cv_95 = psy_critical_values(T, r0=r0, n_sim=20, significance=0.05)
-    cv_99 = psy_critical_values(T, r0=r0, n_sim=20, significance=0.01)
-    print(f"95% CV: {cv_95:.4f}  |  99% CV: {cv_99:.4f}")
+    print(f"95% CV: {cv_95:.4f}")
 
-    if gsadf_stat > cv_99:
-        print(f"=> 1% 유의수준 버블 존재 (강한 증거)")
-    elif gsadf_stat > cv_95:
+    if gsadf_stat > cv_95:
         print(f"=> 5% 유의수준 버블 존재")
     else:
         print(f"=> 버블 존재 증거 없음")
@@ -165,45 +162,47 @@ if __name__ == '__main__':
     print("\nBSADF 시계열 계산 중...")
     bsadf_stats = bsadf(y, r0=r0)
     r0_obs = int(np.floor(r0 * T))
-    bsadf_dates = krx["PRD_DE"].values[r0_obs:]
+    bsadf_dates = df_psy["date"].values[r0_obs:]
 
     # 버블 라벨 생성 (통계적 CV 기준)
     bsadf_arr = np.array(bsadf_stats)
     bubble_label = (bsadf_arr > cv_95).astype(int)
 
     # ── 테스트 폴백: n_sim=20의 Monte Carlo CV가 불안정할 경우 ──────────────────
-    # GSADF가 CV보다 낮아 버블 미검출 시 → BSADF 상위 20%를 임시 임계값으로 사용
-    # (통계적으로 유효하지 않음 — 정식 실행에서는 n_sim=500 PSY_test.py 사용)
-    if bubble_label.sum() == 0:
+    # GSADF가 CV보다 낮거나, 버블 검출 수가 너무 적을 때(5% 미만)
+    # → BSADF 상위 20%를 임시 임계값으로 사용
+    # (통계적으로 유효하지 않음 — 정식 실행: pipeline.py 사용)
+    min_bubble = max(5, int(len(bsadf_arr) * 0.05))  # 최소 5개월 또는 전체의 5%
+    n_before_fallback = int(bubble_label.sum())
+    if n_before_fallback < min_bubble:
         test_cv = np.percentile(bsadf_arr, 80)  # 상위 20%
         bubble_label = (bsadf_arr > test_cv).astype(int)
-        print(f"\n[테스트 모드] PSY 95% CV ({cv_95:.4f})로 버블 미검출")
+        print(f"\n[테스트 모드] PSY 95% CV 기준 버블 {n_before_fallback}개월 → 최소 기준({min_bubble}개월) 미달")
         print(f"  → 테스트용 BSADF 상위 20% 임계값({test_cv:.4f}) 사용")
-        print(f"  → 정식 실행: PSY_test.py (n_sim=500) 결과를 사용하세요\n")
+        print(f"  → 정식 실행: pipeline.py (n_sim=500) 결과를 사용하세요\n")
 
     label_full = np.zeros(T, dtype=int)
     label_full[r0_obs:] = bubble_label
-    krx["bubble"] = label_full
 
     tau = 3
-    pd_values = krx["PD_ratio"].values
+    per_values = df_psy["PER"].values
     bubble_up   = np.zeros(T, dtype=int)
     bubble_down = np.zeros(T, dtype=int)
     for t in range(T):
         if label_full[t] == 1:
             if t + tau < T:
-                future_avg = np.mean(pd_values[t + 1:t + tau + 1])
-                if future_avg > pd_values[t]:
+                future_avg = np.mean(per_values[t + 1:t + tau + 1])
+                if future_avg > per_values[t]:
                     bubble_up[t] = 1
                 else:
                     bubble_down[t] = 1
             else:
                 bubble_down[t] = 1
-    krx["bubble_up"]   = bubble_up
-    krx["bubble_down"] = bubble_down
 
-    labels = krx[["PRD_DE", "PD_ratio", "bubble", "bubble_up", "bubble_down"]].copy()
-    labels = labels.rename(columns={"PRD_DE": "date"})
+    labels = df_psy[["date"]].copy()
+    labels["bubble"]      = label_full
+    labels["bubble_up"]   = bubble_up
+    labels["bubble_down"] = bubble_down
 
     print(f"\nbubble=1:      {label_full.sum()}개월 / {T}개월")
     print(f"bubble_up=1:   {bubble_up.sum()}개월")
@@ -274,16 +273,58 @@ if __name__ == '__main__':
     X_train_sc = scaler.fit_transform(X_train)
     X_test_sc  = scaler.transform(X_test)
 
+    # ── STEP 3-2. XGBoost 하이퍼파라미터 튜닝 ──────────────────────────────────
+    print("\n" + "=" * 60)
+    print("STEP 3-2. XGBoost 하이퍼파라미터 튜닝 (RandomizedSearchCV)")
+    print("=" * 60)
+
+    bubble_ratio = Y_train[:, 0].mean()
+    spw = (1 - bubble_ratio) / bubble_ratio if bubble_ratio > 0 else 6.0
+
+    param_dist = {
+        "estimator__max_depth":        [2, 3, 4],
+        "estimator__n_estimators":     [100, 200, 300],
+        "estimator__learning_rate":    [0.05, 0.1],
+        "estimator__scale_pos_weight": [round(spw * 0.5), round(spw), round(spw * 1.5)],
+    }
+
+    tscv = TimeSeriesSplit(n_splits=3)
+    f1_macro_scorer = make_scorer(f1_score, average="macro", zero_division=0)
+
+    xgb_search = RandomizedSearchCV(
+        MultiOutputClassifier(
+            xgb.XGBClassifier(random_state=42, verbosity=0, eval_metric="logloss")
+        ),
+        param_dist,
+        n_iter=12,
+        cv=tscv,
+        scoring=f1_macro_scorer,
+        n_jobs=1,   # 한글 경로 joblib ASCII 오류 방지
+        random_state=42,
+        refit=True,
+    )
+    print(f"  버블비율={bubble_ratio*100:.1f}% → scale_pos_weight 후보: "
+          f"{[round(spw*0.5), round(spw), round(spw*1.5)]}")
+    print("  탐색 중... (n_iter=12, cv=3-fold TimeSeriesSplit)")
+    xgb_search.fit(X_train, Y_train)
+    print(f"  최적 파라미터: {xgb_search.best_params_}")
+    print(f"  CV F1-macro:  {xgb_search.best_score_:.4f}")
+
+    best_xgb_params = {
+        k.replace("estimator__", ""): v
+        for k, v in xgb_search.best_params_.items()
+    }
+
     # ── STEP 4. 모형 학습 ─────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("STEP 4. 모형 학습 (테스트: n_estimators=50)")
+    print("STEP 4. 모형 학습")
     print("=" * 60)
 
     models = {
-        "XGBoost": (
+        "XGBoost (Tuned)": (
             MultiOutputClassifier(
                 xgb.XGBClassifier(
-                    n_estimators=50, max_depth=4, learning_rate=0.1,
+                    **best_xgb_params,
                     random_state=42, verbosity=0, eval_metric="logloss",
                 )
             ),
@@ -379,8 +420,8 @@ if __name__ == '__main__':
     fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
     for i, label in enumerate(LABEL_COLS):
         axes[i].plot(test_dates, Y_test[:, i],           'k-',  lw=1.5, label="실제")
-        axes[i].plot(test_dates, preds["XGBoost"][:, i], 'r--', lw=1.0, alpha=0.8,
-                     label="XGBoost 예측")
+        axes[i].plot(test_dates, preds["XGBoost (Tuned)"][:, i], 'r--', lw=1.0, alpha=0.8,
+                     label="XGBoost (Tuned) 예측")
         axes[i].set_title(f"{label}  (평가 구간, 테스트 모드)")
         axes[i].set_ylabel("Label")
         axes[i].legend(loc="upper left", fontsize=8)
