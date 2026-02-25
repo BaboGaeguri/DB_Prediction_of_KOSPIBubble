@@ -21,7 +21,7 @@ df = df.sort_values(date_col)
 
 cols = ['Return','PER','PBR','BaseRate','M2',
         'GDP G.R','CPI','Long-term interest rate',
-        'Foreign Net Buy','Institutional Net buy']
+        'Foreign Net Buy','Institutional Net buy','Sentiment']
 
 df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
 
