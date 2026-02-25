@@ -1,14 +1,14 @@
 """
-pipeline.py - KOSPI 버블 예측 파이프라인
+pipeline.py - KOSPI 버블 예측 파이프라인 (정식 실행)
 
-Atsiwo(2025) 3단계 프레임워크를 KOSPI 데이터에 적용
-  Step 1: PSY 버블 라벨 로드  (bubble_labels.csv ← PSY_test.py 출력물)
-  Step 2: 특성 행렬 구성      (ALL DATA.csv + 뉴스심리지수(실험적 통계).csv merge)
-  Step 3: 모형 학습 및 평가   (XGBoost / Logistic Regression / Dummy)
+PSY 검정 + ML 분류 파이프라인을 단일 스크립트로 실행
+  Step 1: PSY 검정 → 버블 라벨 생성  (D.Y.csv, n_sim=500)
+  Step 2: 특성 행렬 구성             (ALL DATA.csv + 뉴스심리지수(실험적 통계).csv)
+  Step 3: 시계열 분할 (70/30) + XGBoost 하이퍼파라미터 튜닝
+  Step 4: 모형 학습 및 평가          (XGBoost (Tuned) / Logistic Regression / Dummy)
 
-실행 순서:
-  1. PSY_test.py 실행 (test mode 해제 후) → bubble_labels.csv 생성
-  2. python pipeline.py
+실행: python pipeline.py  (약 15~20분 소요)
+빠른 테스트: python pipeline_test.py  (약 1~2분 소요)
 """
 
 import numpy as np
@@ -18,13 +18,15 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import warnings
 warnings.filterwarnings('ignore')
+from multiprocessing import Pool, cpu_count
 
 from sklearn.multioutput import MultiOutputClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.dummy import DummyClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.metrics import (
-    f1_score, balanced_accuracy_score, average_precision_score
+    f1_score, balanced_accuracy_score, average_precision_score, make_scorer
 )
 
 try:
@@ -33,261 +35,402 @@ except ImportError:
     raise ImportError("XGBoost가 설치되어 있지 않습니다.\n  pip install xgboost")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 1. 버블 라벨 로드 (PSY_test.py 출력물)
-# ═══════════════════════════════════════════════════════════════════════════════
-print("=" * 60)
-print("STEP 1. 버블 라벨 로드")
-print("=" * 60)
-
-try:
-    labels = pd.read_csv("bubble_labels.csv")
-    labels["PRD_DE"] = pd.to_datetime(labels["PRD_DE"])
-except FileNotFoundError:
-    raise FileNotFoundError(
-        "bubble_labels.csv 없음.\n"
-        "PSY_test.py의 테스트 모드(df.tail(50)) 줄을 제거한 뒤 먼저 실행하세요."
-    )
-
-# 데이터 크기 경고
-MIN_OBS = 60
-if len(labels) < MIN_OBS:
-    print(f"\n[경고] 데이터가 {len(labels)}개로 너무 적습니다 (권장: {MIN_OBS}개 이상).")
-    print("PSY_test.py의 df.tail(50) 줄을 제거하고 전체 데이터로 재실행하세요.\n")
-
-n_bubble = labels["bubble"].sum()
-print(f"기간:          {labels['PRD_DE'].min().strftime('%Y-%m')} ~ {labels['PRD_DE'].max().strftime('%Y-%m')}")
-print(f"전체 시점:     {len(labels)}개")
-print(f"bubble=1:      {n_bubble}개 ({n_bubble / len(labels) * 100:.1f}%)")
-print(f"bubble_up=1:   {labels['bubble_up'].sum()}개")
-print(f"bubble_down=1: {labels['bubble_down'].sum()}개")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 2. 특성 행렬 구성
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 60)
-print("STEP 2. 특성 행렬 구성")
-print("=" * 60)
-
-# ── 2-1. ALL DATA.csv 로드 ────────────────────────────────────────────────────
-all_data = pd.read_csv("ALL DATA.csv")
-# 컬럼명 앞뒤 공백 제거
-all_data.columns = all_data.columns.str.strip()
-all_data["date"] = pd.to_datetime(all_data["date"].str.strip(), format="%Y/%m")
-# Bubble 컬럼 제거 (빈 열 — PSY 결과로 대체)
-if "Bubble" in all_data.columns:
-    all_data = all_data.drop(columns=["Bubble"])
-print(f"ALL DATA.csv: {len(all_data)}행, {len(all_data.columns)}컬럼")
-print(f"  기간: {all_data['date'].min().strftime('%Y-%m')} ~ {all_data['date'].max().strftime('%Y-%m')}")
-print(f"  컬럼: {list(all_data.columns)}")
-
-# ── 2-2. 뉴스심리지수 로드 ───────────────────────────────────────────────────
-news = pd.read_csv(
-    "뉴스심리지수(실험적 통계).csv",
-    header=None,
-    names=["date", "news_sentiment"]
-)
-news["date"] = pd.to_datetime(news["date"], format="%Y/%m")
-print(f"\n뉴스심리지수: {len(news)}행")
-print(f"  기간: {news['date'].min().strftime('%Y-%m')} ~ {news['date'].max().strftime('%Y-%m')}")
-
-# ── 2-3. 날짜 기준 merge ─────────────────────────────────────────────────────
-# bubble_labels는 PRD_DE 컬럼, all_data/news는 date 컬럼
-labels_renamed = labels.rename(columns={"PRD_DE": "date"})
-
-df = labels_renamed.merge(all_data, on="date", how="inner")
-df = df.merge(news, on="date", how="inner")
-df = df.sort_values("date").reset_index(drop=True)
-
-print(f"\nmerge 후: {len(df)}행")
-print(f"  기간: {df['date'].min().strftime('%Y-%m')} ~ {df['date'].max().strftime('%Y-%m')}")
-
-# ── 2-4. 특성 목록 확정 & 결측치 제거 ────────────────────────────────────────
-LABEL_COLS   = ["bubble", "bubble_up", "bubble_down"]
-EXCLUDE_COLS = ["date", "PD_ratio"] + LABEL_COLS
-
-# ALL DATA.csv 특성 + 뉴스심리지수
-MACRO_FEATURES = [
-    "Return",
-    "PER",
-    "Dividend Yield",
-    "BaseRate",
-    "M2",
-    "GDP G.R",
-    "CPI",
-    "Long-term interest rate",
-    "Foreign Net Buy",
-    "Institutional Net buy",
-    "news_sentiment",
-]
-
-# 실제 존재하는 컬럼만 선택
-feature_cols = [c for c in MACRO_FEATURES if c in df.columns]
-missing_features = [c for c in MACRO_FEATURES if c not in df.columns]
-if missing_features:
-    print(f"\n[경고] 누락된 특성 컬럼: {missing_features}")
-
-df = df.dropna(subset=feature_cols).reset_index(drop=True)
-
-print(f"\n특성 수: {len(feature_cols)}개")
-print(f"유효 시점: {len(df)}개  "
-      f"({df['date'].min().strftime('%Y-%m')} ~ {df['date'].max().strftime('%Y-%m')})")
-print(f"특성 목록: {feature_cols}")
+# ── PSY 함수 ─────────────────────────────────────────────────────────────────
+def adf_stat(y, lag=0):
+    dy = np.diff(y)
+    y_lag = y[:-1]
+    if lag > 0:
+        n = len(dy) - lag
+        if n <= lag + 2:
+            return np.nan
+        X = np.empty((n, lag + 2))
+        X[:, 0] = 1.0
+        X[:, 1] = y_lag[lag:]
+        for i in range(lag):
+            X[:, i + 2] = dy[lag - i - 1:len(dy) - i - 1]
+        dy = dy[lag:]
+    else:
+        n = len(dy)
+        if n <= 2:
+            return np.nan
+        X = np.column_stack([np.ones(n), y_lag])
+    n, k = X.shape
+    if n <= k:
+        return np.nan
+    XtX = X.T @ X
+    Xty = X.T @ dy
+    try:
+        beta = np.linalg.solve(XtX, Xty)
+    except np.linalg.LinAlgError:
+        return np.nan
+    residuals = dy - X @ beta
+    sigma2 = np.dot(residuals, residuals) / (n - k)
+    try:
+        cov = sigma2 * np.linalg.inv(XtX)
+    except np.linalg.LinAlgError:
+        return np.nan
+    se = np.sqrt(cov[1, 1])
+    return beta[1] / se if se > 0 else np.nan
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 3-1. 시계열 기반 학습/검증 분할
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 60)
-print("STEP 3. 시계열 기반 학습/검증 분할 (시간 순서 유지)")
-print("=" * 60)
-
-TRAIN_RATIO = 0.7  # 앞 70% 학습 / 뒤 30% 평가
-
-split_idx = int(len(df) * TRAIN_RATIO)
-X      = df[feature_cols].values
-Y      = df[LABEL_COLS].values          # shape: (T, 3)
-dates  = df["date"]
-
-X_train, X_test = X[:split_idx], X[split_idx:]
-Y_train, Y_test = Y[:split_idx], Y[split_idx:]
-
-print(f"학습 구간: ~ {dates.iloc[split_idx - 1].strftime('%Y-%m')}  ({split_idx}개월)")
-print(f"평가 구간:   {dates.iloc[split_idx].strftime('%Y-%m')} ~ "
-      f"{dates.iloc[-1].strftime('%Y-%m')}  ({len(df) - split_idx}개월)")
-print(f"학습 버블 비율: {Y_train[:, 0].mean() * 100:.1f}%")
-print(f"평가 버블 비율: {Y_test[:, 0].mean() * 100:.1f}%")
-
-# 정규화 (Logistic Regression용; XGBoost는 불필요하나 인터페이스 통일)
-scaler      = StandardScaler()
-X_train_sc  = scaler.fit_transform(X_train)
-X_test_sc   = scaler.transform(X_test)
+def bsadf(y, r0=None, lag=0):
+    T = len(y)
+    if r0 is None:
+        r0 = 0.01 + 1.8 / np.sqrt(T)
+    r0_obs = int(np.floor(r0 * T))
+    adf_stats = []
+    for end in range(r0_obs, T):
+        sup_adf = -np.inf
+        for start in range(0, end - r0_obs + 1):
+            y_sub = y[start:end + 1]
+            if len(y_sub) > lag + 2:
+                stat = adf_stat(y_sub, lag=lag)
+                if stat is not None and not np.isnan(stat) and stat > sup_adf:
+                    sup_adf = stat
+        adf_stats.append(sup_adf)
+    return adf_stats
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 3-2. 모형 정의
-# ═══════════════════════════════════════════════════════════════════════════════
-# MultiOutputClassifier: 각 라벨(bubble, bubble_up, bubble_down)에
-# 독립적인 이진 분류기를 학습 — multilabel 구조 구현
-
-models = {
-    "XGBoost": (
-        MultiOutputClassifier(
-            xgb.XGBClassifier(
-                n_estimators=100,
-                max_depth=4,
-                learning_rate=0.1,
-                random_state=42,
-                verbosity=0,
-                eval_metric="logloss",
-            )
-        ),
-        False,   # scaled 여부 (XGBoost는 원본 스케일 사용)
-    ),
-    "Logistic Regression": (
-        MultiOutputClassifier(
-            LogisticRegression(max_iter=1000, random_state=42)
-        ),
-        True,
-    ),
-    "Dummy (Always 0)": (
-        MultiOutputClassifier(
-            DummyClassifier(strategy="most_frequent", random_state=42)
-        ),
-        True,
-    ),
-}
+def gsadf(y, r0=None, lag=0):
+    T = len(y)
+    if r0 is None:
+        r0 = 0.01 + 1.8 / np.sqrt(T)
+    r0_obs = int(np.floor(r0 * T))
+    sup_adf = -np.inf
+    for start in range(T - r0_obs + 1):
+        for end in range(start + r0_obs, T + 1):
+            y_sub = y[start:end]
+            if len(y_sub) > lag + 2:
+                stat = adf_stat(y_sub, lag=lag)
+                if stat is not None and not np.isnan(stat) and stat > sup_adf:
+                    sup_adf = stat
+    return sup_adf if sup_adf > -np.inf else np.nan
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 3-3. 학습 및 예측
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 60)
-print("STEP 3-3. 모형 학습")
-print("=" * 60)
-
-preds = {}
-probas = {}
-
-for name, (model, use_scaled) in models.items():
-    print(f"  [{name}] 학습 중...")
-    Xtr = X_train_sc if use_scaled else X_train
-    Xte = X_test_sc  if use_scaled else X_test
-
-    model.fit(Xtr, Y_train)
-    preds[name] = model.predict(Xte)
-
-    # predict_proba → list of (n_samples, n_classes) per label
-    raw_proba = model.predict_proba(Xte)
-    proba_mat = np.zeros((len(Xte), len(LABEL_COLS)))
-    for j, p_arr in enumerate(raw_proba):
-        proba_mat[:, j] = p_arr[:, 1] if p_arr.shape[1] >= 2 else p_arr[:, 0]
-    probas[name] = proba_mat
+def _sim_worker(args):
+    T, r0 = args
+    np.random.seed()
+    y_sim = np.cumsum(np.random.randn(T))
+    return gsadf(y_sim, r0=r0)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 4. 성능 평가 (out-of-sample)
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 60)
-print("STEP 4. 성능 평가 (평가 구간 기준)")
-print("=" * 60)
+def psy_critical_values(T, r0=None, n_sim=500, significances=(0.10, 0.05, 0.01)):
+    """Monte Carlo를 한 번 실행하여 여러 유의수준의 CV를 동시에 반환"""
+    if r0 is None:
+        r0 = 0.01 + 1.8 / np.sqrt(T)
+    n_cores = max(1, cpu_count() - 1)
+    print(f"  (코어: {n_cores}, 시뮬: {n_sim}회)")
+    with Pool(n_cores) as pool:
+        results = pool.map(_sim_worker, [(T, r0)] * n_sim)
+    gsadf_sim = [r for r in results if r is not None and not np.isnan(r)]
+    return {sl: np.percentile(gsadf_sim, (1 - sl) * 100) for sl in significances}
 
 
-def evaluate(y_true_all, y_pred_all, y_prob_all, label_names):
-    """라벨별 PR-AUC / F1 / Balanced Accuracy를 딕셔너리로 반환"""
-    row = {}
-    for i, label in enumerate(label_names):
-        yt  = y_true_all[:, i]
-        yp  = y_pred_all[:, i]
-        ypr = y_prob_all[:, i]
-        row[f"{label}_PRAUC"] = (
-            average_precision_score(yt, ypr)
-            if len(np.unique(yt)) >= 2 else np.nan
+# ════════════════════════════════════════════════════════════════════════════════
+if __name__ == '__main__':
+
+    # ── STEP 1. PSY 검정 → 버블 라벨 생성 ────────────────────────────────────
+    print("=" * 60)
+    print("STEP 1. PSY 검정 (n_sim=500 정식 Monte Carlo)")
+    print("=" * 60)
+
+    df_psy = pd.read_csv("ALL DATA.csv")
+    df_psy.columns = df_psy.columns.str.strip()
+    df_psy["date"] = pd.to_datetime(df_psy["date"].str.strip(), format="%Y/%m")
+    if "Bubble" in df_psy.columns:
+        df_psy = df_psy.drop(columns=["Bubble"])
+    df_psy = df_psy.sort_values("date").reset_index(drop=True)
+
+    y = df_psy["PER"].values  # PSY 검정 변수: PER (버블 시 폭발적 상승 경향)
+    T = len(y)
+    r0 = 15 / T  # 최소 윈도우 15개월 고정 (PSY 권장 공식 대체)
+
+    print(f"PSY 데이터 (PER): {df_psy['date'].min().strftime('%Y-%m')} ~ {df_psy['date'].max().strftime('%Y-%m')} ({T}개월)")
+    print(f"r0={r0:.4f}, 최소 윈도우={int(np.floor(r0 * T))}개월\n")
+
+    print("GSADF 계산 중...")
+    gsadf_stat = gsadf(y, r0=r0)
+    print(f"GSADF 통계량: {gsadf_stat:.4f}")
+
+    print("\n임계값 계산 중 (Monte Carlo, n_sim=500)...")
+    cvs = psy_critical_values(T, r0=r0, n_sim=500)
+    cv_90, cv_95, cv_99 = cvs[0.10], cvs[0.05], cvs[0.01]
+    print(f"90% CV: {cv_90:.4f}  |  95% CV: {cv_95:.4f}  |  99% CV: {cv_99:.4f}")
+
+    if gsadf_stat > cv_99:
+        print(f"=> 1% 유의수준 버블 존재 (강한 증거)")
+    elif gsadf_stat > cv_95:
+        print(f"=> 5% 유의수준 버블 존재")
+    elif gsadf_stat > cv_90:
+        print(f"=> 10% 유의수준 버블 존재 (완화된 기준 적용)")
+    else:
+        print(f"=> 버블 존재 증거 없음 (GSADF={gsadf_stat:.4f} < CV_90={cv_90:.4f})")
+        raise RuntimeError(
+            "PSY 검정에서 10% 유의수준에서도 버블이 검출되지 않았습니다.\n"
+            "  데이터 범위·r0 설정을 확인하거나,\n"
+            "  빠른 테스트는 pipeline_test.py를 사용하세요."
         )
-        row[f"{label}_F1"] = f1_score(yt, yp, average="binary", zero_division=0)
-        row[f"{label}_BA"] = balanced_accuracy_score(yt, yp)
-    row["F1_macro"] = f1_score(y_true_all, y_pred_all, average="macro", zero_division=0)
-    return row
 
+    print("\nBSADF 시계열 계산 중...")
+    bsadf_stats = bsadf(y, r0=r0)
+    r0_obs = int(np.floor(r0 * T))
 
-records = []
-for name in models:
-    row = {"Model": name}
-    row.update(evaluate(Y_test, preds[name], probas[name], LABEL_COLS))
-    records.append(row)
+    # 버블 라벨 생성: 검출된 유의수준의 CV 사용
+    # (GSADF > cv_99 → cv_99, > cv_95 → cv_95, > cv_90 → cv_90)
+    bsadf_arr = np.array(bsadf_stats)
+    if gsadf_stat > cv_99:
+        label_cv = cv_99
+        label_sig = "1%"
+    elif gsadf_stat > cv_95:
+        label_cv = cv_95
+        label_sig = "5%"
+    else:
+        label_cv = cv_90
+        label_sig = "10%"
+    print(f"버블 라벨 기준: {label_sig} 유의수준 CV ({label_cv:.4f})")
+    bubble_label = (bsadf_arr > label_cv).astype(int)
 
-results = pd.DataFrame(records).set_index("Model")
+    label_full = np.zeros(T, dtype=int)
+    label_full[r0_obs:] = bubble_label
 
-# 출력
-print("\n[bubble 이진 분류]")
-print(results[["bubble_PRAUC", "bubble_F1", "bubble_BA"]].round(4).to_string())
+    tau = 3
+    per_values = df_psy["PER"].values
+    bubble_up   = np.zeros(T, dtype=int)
+    bubble_down = np.zeros(T, dtype=int)
+    for t in range(T):
+        if label_full[t] == 1:
+            if t + tau < T:
+                future_avg = np.mean(per_values[t + 1:t + tau + 1])
+                if future_avg > per_values[t]:
+                    bubble_up[t] = 1
+                else:
+                    bubble_down[t] = 1
+            else:
+                bubble_down[t] = 1
 
-print("\n[bubble_up / bubble_down]")
-up_down_cols = [c for c in results.columns if "bubble_up" in c or "bubble_down" in c]
-print(results[up_down_cols].round(4).to_string())
+    labels = df_psy[["date"]].copy()
+    labels["bubble"]      = label_full
+    labels["bubble_up"]   = bubble_up
+    labels["bubble_down"] = bubble_down
 
-print("\n[전체 Multilabel F1-macro]")
-print(results[["F1_macro"]].round(4).to_string())
+    print(f"\nbubble=1:      {label_full.sum()}개월 / {T}개월 ({label_full.mean()*100:.1f}%)")
+    print(f"bubble_up=1:   {bubble_up.sum()}개월")
+    print(f"bubble_down=1: {bubble_down.sum()}개월")
 
-results.to_csv("model_results.csv", encoding="utf-8-sig")
-print("\n결과 저장: model_results.csv")
+    # ── STEP 2. 특성 행렬 구성 ────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("STEP 2. 특성 행렬 구성")
+    print("=" * 60)
 
+    all_data = pd.read_csv("ALL DATA.csv")
+    all_data.columns = all_data.columns.str.strip()
+    all_data["date"] = pd.to_datetime(all_data["date"].str.strip(), format="%Y/%m")
+    if "Bubble" in all_data.columns:
+        all_data = all_data.drop(columns=["Bubble"])
+    print(f"ALL DATA.csv: {len(all_data)}행, 기간: "
+          f"{all_data['date'].min().strftime('%Y-%m')} ~ {all_data['date'].max().strftime('%Y-%m')}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 5. 시각화
-# ═══════════════════════════════════════════════════════════════════════════════
-test_dates = dates.iloc[split_idx:].values
+    news = pd.read_csv(
+        "뉴스심리지수(실험적 통계).csv",
+        header=None,
+        names=["date", "news_sentiment"]
+    )
+    news["date"] = pd.to_datetime(news["date"], format="%Y/%m")
+    print(f"뉴스심리지수: {len(news)}행, 기간: "
+          f"{news['date'].min().strftime('%Y-%m')} ~ {news['date'].max().strftime('%Y-%m')}")
 
-fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
-for i, label in enumerate(LABEL_COLS):
-    axes[i].plot(test_dates, Y_test[:, i],           'k-',  lw=1.5, label="실제")
-    axes[i].plot(test_dates, preds["XGBoost"][:, i], 'r--', lw=1.0, alpha=0.8, label="XGBoost 예측")
-    axes[i].set_title(f"{label}  (평가 구간)")
-    axes[i].set_ylabel("Label")
-    axes[i].legend(loc="upper left", fontsize=8)
-    axes[i].grid(True, alpha=0.3)
+    df = labels.merge(all_data, on="date", how="inner")
+    df = df.merge(news, on="date", how="inner")
+    df = df.sort_values("date").reset_index(drop=True)
 
-plt.tight_layout()
-plt.savefig("pipeline_result.png", dpi=150)
-print("시각화 저장: pipeline_result.png")
+    print(f"\nmerge 후: {len(df)}행  "
+          f"({df['date'].min().strftime('%Y-%m')} ~ {df['date'].max().strftime('%Y-%m')})")
+
+    LABEL_COLS = ["bubble", "bubble_up", "bubble_down"]
+    MACRO_FEATURES = [
+        "Return", "PER", "Dividend Yield", "BaseRate", "M2",
+        "GDP G.R", "CPI", "Long-term interest rate",
+        "Foreign Net Buy", "Institutional Net buy", "news_sentiment",
+    ]
+    feature_cols = [c for c in MACRO_FEATURES if c in df.columns]
+    missing_features = [c for c in MACRO_FEATURES if c not in df.columns]
+    if missing_features:
+        print(f"[경고] 누락된 특성 컬럼: {missing_features}")
+
+    df = df.dropna(subset=feature_cols).reset_index(drop=True)
+    print(f"특성: {len(feature_cols)}개 | 유효 시점: {len(df)}개")
+
+    # ── STEP 3. 시계열 분할 ───────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("STEP 3. 시계열 분할 (70/30)")
+    print("=" * 60)
+
+    TRAIN_RATIO = 0.7
+    split_idx = int(len(df) * TRAIN_RATIO)
+    X     = df[feature_cols].values
+    Y     = df[LABEL_COLS].values
+    dates = df["date"]
+
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    Y_train, Y_test = Y[:split_idx], Y[split_idx:]
+
+    print(f"학습: ~ {dates.iloc[split_idx - 1].strftime('%Y-%m')} ({split_idx}개월) | "
+          f"버블비율={Y_train[:, 0].mean() * 100:.1f}%")
+    print(f"평가:   {dates.iloc[split_idx].strftime('%Y-%m')} ~ "
+          f"{dates.iloc[-1].strftime('%Y-%m')} ({len(df) - split_idx}개월) | "
+          f"버블비율={Y_test[:, 0].mean() * 100:.1f}%")
+
+    scaler     = StandardScaler()
+    X_train_sc = scaler.fit_transform(X_train)
+    X_test_sc  = scaler.transform(X_test)
+
+    # ── STEP 3-2. XGBoost 하이퍼파라미터 튜닝 ──────────────────────────────────
+    print("\n" + "=" * 60)
+    print("STEP 3-2. XGBoost 하이퍼파라미터 튜닝 (RandomizedSearchCV)")
+    print("=" * 60)
+
+    bubble_ratio = Y_train[:, 0].mean()
+    spw = (1 - bubble_ratio) / bubble_ratio if bubble_ratio > 0 else 6.0
+
+    param_dist = {
+        "estimator__max_depth":        [2, 3, 4],
+        "estimator__n_estimators":     [100, 200, 300],
+        "estimator__learning_rate":    [0.05, 0.1],
+        "estimator__scale_pos_weight": [round(spw * 0.5), round(spw), round(spw * 1.5)],
+    }
+
+    tscv = TimeSeriesSplit(n_splits=3)
+    f1_macro_scorer = make_scorer(f1_score, average="macro", zero_division=0)
+
+    xgb_search = RandomizedSearchCV(
+        MultiOutputClassifier(
+            xgb.XGBClassifier(random_state=42, verbosity=0, eval_metric="logloss")
+        ),
+        param_dist,
+        n_iter=12,
+        cv=tscv,
+        scoring=f1_macro_scorer,
+        n_jobs=1,   # 한글 경로 joblib ASCII 오류 방지
+        random_state=42,
+        refit=True,
+    )
+    print(f"  버블비율={bubble_ratio*100:.1f}% → scale_pos_weight 후보: "
+          f"{[round(spw*0.5), round(spw), round(spw*1.5)]}")
+    print("  탐색 중... (n_iter=12, cv=3-fold TimeSeriesSplit)")
+    xgb_search.fit(X_train, Y_train)
+    print(f"  최적 파라미터: {xgb_search.best_params_}")
+    print(f"  CV F1-macro:  {xgb_search.best_score_:.4f}")
+
+    best_xgb_params = {
+        k.replace("estimator__", ""): v
+        for k, v in xgb_search.best_params_.items()
+    }
+
+    # ── STEP 4. 모형 학습 ─────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("STEP 4. 모형 학습")
+    print("=" * 60)
+
+    models = {
+        "XGBoost (Tuned)": (
+            MultiOutputClassifier(
+                xgb.XGBClassifier(
+                    **best_xgb_params,
+                    random_state=42, verbosity=0, eval_metric="logloss",
+                )
+            ),
+            False,
+        ),
+        "Logistic Regression": (
+            MultiOutputClassifier(
+                LogisticRegression(max_iter=1000, random_state=42)
+            ),
+            True,
+        ),
+        "Dummy (Always 0)": (
+            MultiOutputClassifier(
+                DummyClassifier(strategy="most_frequent", random_state=42)
+            ),
+            True,
+        ),
+    }
+
+    preds  = {}
+    probas = {}
+    for name, (model, use_scaled) in models.items():
+        print(f"  [{name}] 학습 중...")
+        Xtr = X_train_sc if use_scaled else X_train
+        Xte = X_test_sc  if use_scaled else X_test
+        try:
+            model.fit(Xtr, Y_train)
+        except ValueError as e:
+            print(f"    [스킵] {name} 학습 실패: {e}")
+            preds[name]  = np.zeros((len(Xte), len(LABEL_COLS)), dtype=int)
+            probas[name] = np.zeros((len(Xte), len(LABEL_COLS)))
+            continue
+        preds[name] = model.predict(Xte)
+        raw_proba   = model.predict_proba(Xte)
+        proba_mat   = np.zeros((len(Xte), len(LABEL_COLS)))
+        for j, p_arr in enumerate(raw_proba):
+            proba_mat[:, j] = p_arr[:, 1] if p_arr.shape[1] >= 2 else p_arr[:, 0]
+        probas[name] = proba_mat
+
+    # ── STEP 5. 성능 평가 ─────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("STEP 5. 성능 평가 (out-of-sample)")
+    print("=" * 60)
+
+    def evaluate(y_true_all, y_pred_all, y_prob_all, label_names):
+        row = {}
+        for i, label in enumerate(label_names):
+            yt  = y_true_all[:, i]
+            yp  = y_pred_all[:, i]
+            ypr = y_prob_all[:, i]
+            row[f"{label}_PRAUC"] = (
+                average_precision_score(yt, ypr)
+                if len(np.unique(yt)) >= 2 else np.nan
+            )
+            row[f"{label}_F1"] = f1_score(yt, yp, average="binary", zero_division=0)
+            row[f"{label}_BA"] = balanced_accuracy_score(yt, yp)
+        row["F1_macro"] = f1_score(y_true_all, y_pred_all, average="macro", zero_division=0)
+        return row
+
+    records = []
+    for name in models:
+        row = {"Model": name}
+        row.update(evaluate(Y_test, preds[name], probas[name], LABEL_COLS))
+        records.append(row)
+
+    results = pd.DataFrame(records).set_index("Model")
+
+    print("\n[bubble 이진 분류]")
+    print(results[["bubble_PRAUC", "bubble_F1", "bubble_BA"]].round(4).to_string())
+
+    print("\n[bubble_up / bubble_down]")
+    up_down_cols = [c for c in results.columns if "bubble_up" in c or "bubble_down" in c]
+    if up_down_cols:
+        print(results[up_down_cols].round(4).to_string())
+
+    print("\n[전체 Multilabel F1-macro]")
+    print(results[["F1_macro"]].round(4).to_string())
+
+    results.to_csv("model_results.csv", encoding="utf-8-sig")
+    print("\n결과 저장: model_results.csv")
+
+    # ── STEP 6. 시각화 ────────────────────────────────────────────────────────
+    test_dates = dates.iloc[split_idx:].values
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    for i, label in enumerate(LABEL_COLS):
+        axes[i].plot(test_dates, Y_test[:, i],           'k-',  lw=1.5, label="실제")
+        axes[i].plot(test_dates, preds["XGBoost (Tuned)"][:, i], 'r--', lw=1.0, alpha=0.8,
+                     label="XGBoost (Tuned) 예측")
+        axes[i].set_title(f"{label}  (평가 구간)")
+        axes[i].set_ylabel("Label")
+        axes[i].legend(loc="upper left", fontsize=8)
+        axes[i].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig("pipeline_result.png", dpi=150)
+    print("시각화 저장: pipeline_result.png")
+    print("\n[완료]")
