@@ -5,7 +5,7 @@ import numpy as np
 # 1. 데이터 불러오기
 # ==============================
 
-df = pd.read_csv("ALLDATA.csv")   # ← 파일명 수정
+df = pd.read_csv("찐찐ALLDATA.csv")   # ← 파일명 수정
 
 # 컬럼 공백 제거 (혹시 모를 오류 방지)
 df.columns = df.columns.str.strip()
